@@ -93,6 +93,7 @@ test("a safe JSON5 config and the Cain pin pass", () => {
   assert.equal(result.status, 0, result.stdout);
   assert.match(result.stdout, /installed package version 2026\.6\.10 is at or newer/u);
   assert.match(result.stdout, /exact target 2026\.6\.10/u);
+  assert.match(result.stdout, /Summary: No security problems found; exit code 0\./u);
 });
 
 test("versions before 2026.1.29 are reported as affected", () => {
@@ -151,8 +152,12 @@ test("moving install targets are flagged", () => {
     },
   });
   const result = run(f, ["--install-spec", "latest"]);
-  assert.equal(result.status, 1);
+  assert.equal(result.status, 0, result.stdout);
   assert.match(result.stdout, /install target latest is moving/u);
+  assert.match(
+    result.stdout,
+    /Summary: No security problems found\. 1 item flagged for your review; exit code 0\./u,
+  );
 });
 
 test("plain config token wins over the auditor environment", () => {
@@ -167,7 +172,7 @@ test("plain config token wins over the auditor environment", () => {
   const result = run(f, ["--install-spec", "2026.6.10"], {
     OPENCLAW_GATEWAY_TOKEN: "A".repeat(48),
   });
-  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.status, 0, result.stdout);
   assert.match(result.stdout, /Gateway authentication: present via config, length 6/u);
   assert.doesNotMatch(result.stdout, /Gateway authentication:.*length 48/u);
 });
@@ -204,7 +209,7 @@ test("all supported string env refs fail closed when unresolved", () => {
       MY_LONG_GATEWAY_TOKEN_ID_123456: "B".repeat(48),
       OPENCLAW_GATEWAY_TOKEN: "C".repeat(48),
     });
-    assert.equal(result.status, 1, result.stdout);
+    assert.equal(result.status, 0, result.stdout);
     assert.match(result.stdout, /\[CANNOT CHECK\] Gateway authentication/u);
     assert.doesNotMatch(result.stdout, /\[PASS\] Gateway authentication/u);
   }
@@ -261,7 +266,7 @@ test("a plain config token wins over gateway.systemd.env", () => {
     { mode: 0o600 },
   );
   const result = run(f, ["--install-spec", "2026.6.10"]);
-  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.status, 0, result.stdout);
   assert.match(result.stdout, /Gateway authentication: present via config, length 6/u);
   assert.doesNotMatch(result.stdout, /Gateway authentication:.*length 48/u);
 });
@@ -276,12 +281,16 @@ test("a stopped Gateway without a disk token is reported as unverified", () => {
     },
   });
   const result = run(f, ["--install-spec", "2026.6.10"]);
-  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.status, 0, result.stdout);
   assert.match(
     result.stdout,
     /\[CANNOT CHECK\] Gateway authentication: token auth is selected, but no token was found in config, state \.env, or gateway\.systemd\.env/u,
   );
   assert.doesNotMatch(result.stdout, /no credential is configured/u);
+  assert.match(
+    result.stdout,
+    /Summary: No security problems found\. 1 could not be checked; exit code 0\./u,
+  );
 });
 
 test("an env ref can use the matched Gateway process bootstrap token", () => {
@@ -406,9 +415,58 @@ test("plugin inventory includes dist-runtime and config-directory roots", () => 
   );
   fs.writeFileSync(path.join(managed, "openclaw.plugin.json"), JSON.stringify({ id: "review-me" }));
   const result = run(f, ["--install-spec", "2026.6.10"]);
-  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.status, 0, result.stdout);
   assert.match(result.stdout, /Bundled plugins: 1: stock-only/u);
   assert.match(result.stdout, /Third-party plugins: 1: review-me/u);
+});
+
+test("WARN and CANNOT CHECK results alone exit 0 with a severity-aware summary", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token", token: "0123456789abcdef0123456789abcdef" },
+    },
+  });
+  const plugin = path.join(f.stateDir, "extensions", "review-plugin");
+  const skill = path.join(f.stateDir, "skills", "review-skill");
+  fs.mkdirSync(plugin, { recursive: true });
+  fs.mkdirSync(skill, { recursive: true });
+  fs.writeFileSync(
+    path.join(plugin, "openclaw.plugin.json"),
+    JSON.stringify({ id: "review-plugin" }),
+  );
+  fs.writeFileSync(path.join(skill, "SKILL.md"), "---\nname: review-skill\n---\n");
+
+  const result = run(f);
+  assert.equal(result.status, 0, result.stdout);
+  assert.match(result.stdout, /\[WARN\] Third-party plugins:/u);
+  assert.match(result.stdout, /\[WARN\] Third-party skills:/u);
+  assert.match(result.stdout, /\[CANNOT CHECK\] Installation pin:/u);
+  assert.match(
+    result.stdout,
+    /Summary: No security problems found\. 2 items flagged for your review, 1 could not be checked; exit code 0\./u,
+  );
+});
+
+test("a FAIL exits 1 with a security-problem summary", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "lan",
+      port: TEST_PORT,
+      auth: {
+        mode: "token",
+        token: "0123456789abcdef0123456789abcdef",
+        rateLimit: {},
+      },
+    },
+  });
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 1, result.stdout);
+  assert.equal(result.stdout.match(/^\[FAIL\]/gmu)?.length, 1, result.stdout);
+  assert.match(result.stdout, /Summary: 1 problem needs attention; exit code 1\./u);
 });
 
 test("canary secrets never appear through config, env-file, ref, or password branches", () => {
@@ -456,9 +514,12 @@ test("canary secrets never appear through config, env-file, ref, or password bra
   }
 });
 
-test("the script contains no network or process-launch API calls", () => {
+test("the script contains no network, process-launch, or write API calls", () => {
   const source = fs.readFileSync(script, "utf8");
-  assert.doesNotMatch(source, /fetch|http|https\.request|net\.connect|child_process|exec|spawn/iu);
+  assert.doesNotMatch(
+    source,
+    /fetch|http|https\.request|net\.connect|child_process|exec|spawn|writeFile/iu,
+  );
   assert.doesNotMatch(source, /node:(?:http|https|net|tls|dns|dgram)/u);
 });
 

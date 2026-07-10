@@ -466,7 +466,8 @@ function resolvePaths(options) {
 
 class Reporter {
   constructor() {
-    this.issues = 0;
+    this.failures = 0;
+    this.warnings = 0;
     this.unknowns = 0;
   }
 
@@ -479,20 +480,39 @@ class Reporter {
   }
 
   warn(label, detail) {
-    this.issues += 1;
+    this.warnings += 1;
     console.log(`[WARN] ${label}: ${detail}`);
   }
 
   fail(label, detail) {
-    this.issues += 1;
+    this.failures += 1;
     console.log(`[FAIL] ${label}: ${detail}`);
   }
 
   unknown(label, detail) {
-    this.issues += 1;
     this.unknowns += 1;
     console.log(`[CANNOT CHECK] ${label}: ${detail}`);
   }
+}
+
+function printSummary(reporter) {
+  const reviewNote =
+    reporter.warnings > 0
+      ? `${reporter.warnings} item${reporter.warnings === 1 ? "" : "s"} flagged for your review`
+      : null;
+  const unknownNote = reporter.unknowns > 0 ? `${reporter.unknowns} could not be checked` : null;
+  const secondaryNotes = [reviewNote, unknownNote].filter(Boolean);
+  if (reporter.failures === 0) {
+    const detail =
+      secondaryNotes.length > 0
+        ? `No security problems found. ${secondaryNotes.join(", ")}`
+        : "No security problems found";
+    console.log(`Summary: ${detail}; exit code 0.`);
+    return 0;
+  }
+  const problems = `${reporter.failures} problem${reporter.failures === 1 ? "" : "s"} ${reporter.failures === 1 ? "needs" : "need"} attention`;
+  console.log(`Summary: ${[problems, ...secondaryNotes].join(", ")}; exit code 1.`);
+  return 1;
 }
 
 function formatMode(mode) {
@@ -1623,13 +1643,7 @@ function main() {
   collectSkills(packageInfo, paths.stateDir, config, paths.home, plugins, reporter);
 
   console.log("");
-  if (reporter.issues === 0) {
-    console.log("Summary: no issues found by the checks that could be completed; exit code 0.");
-    return 0;
-  }
-  const unknownNote = reporter.unknowns > 0 ? ` (${reporter.unknowns} could not be checked)` : "";
-  console.log(`Summary: ${reporter.issues} issue(s) need attention${unknownNote}; exit code 1.`);
-  return 1;
+  return printSummary(reporter);
 }
 
 function isDirectRun() {

@@ -56,17 +56,19 @@ Config: ~/.openclaw/openclaw.json
 [PASS] Installation pin: exact target 2026.6.10 is recorded for this check.
 [WARN] Third-party plugins: 1: example-plugin. Review it yourself; no malware verdict was attempted.
 
-Summary: 1 issue(s) need attention; exit code 1.
+Summary: No security problems found. 1 item flagged for your review; exit code 0.
 ```
 
 Secret value: `[REDACTED — never present in output]`.
 
 ## Exit codes
 
+The summary counts security problems (`FAIL`), manual-review items (`WARN`), and incomplete checks (`CANNOT CHECK`) separately. `WARN` and `CANNOT CHECK` results alone do not make the process fail; only a `FAIL` returns exit code `1`.
+
 | Code | Meaning                                                                                          |
 | ---: | ------------------------------------------------------------------------------------------------ |
-|  `0` | All checks that applied passed.                                                                  |
-|  `1` | At least one problem, review item, or incomplete check needs attention.                          |
+|  `0` | No `FAIL` security problems were found; `WARN` or `CANNOT CHECK` results may still be present.   |
+|  `1` | At least one `FAIL` security problem needs attention.                                            |
 |  `2` | The command line is invalid, or the config could not be found, read, included, or parsed safely. |
 
 ## Deliberate limitations
