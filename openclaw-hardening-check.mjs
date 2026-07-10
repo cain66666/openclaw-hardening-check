@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const FIXED_VERSION = "2026.1.29";
 const DEFAULT_GATEWAY_PORT = 18789;
@@ -558,20 +559,36 @@ function readProcessEnv(pid) {
       const equals = entry.indexOf("=");
       if (equals <= 0) continue;
       const key = entry.slice(0, equals);
-      if (
-        key === "OPENCLAW_CONFIG_PATH" ||
-        key === "OPENCLAW_STATE_DIR" ||
-        key === "OPENCLAW_GATEWAY_PORT" ||
-        key === "OPENCLAW_GATEWAY_TOKEN" ||
-        key === "OPENCLAW_GATEWAY_PASSWORD"
-      ) {
-        result[key] = entry.slice(equals + 1);
-      }
+      result[key] = entry.slice(equals + 1);
     }
   } catch {
     return null;
   }
   return result;
+}
+
+function normalizeProcArg(arg) {
+  return String(arg).replaceAll("\\", "/").trim().toLowerCase();
+}
+
+function isGatewayArgv(args, { allowGatewayBinary = true } = {}) {
+  const normalized = args.map(normalizeProcArg);
+  if (!normalized.includes("gateway")) return false;
+  const entryCandidates = [
+    "dist/index.js",
+    "dist/entry.js",
+    "openclaw.mjs",
+    "scripts/run-node.mjs",
+    "src/entry.ts",
+    "src/index.ts",
+  ];
+  if (normalized.some((arg) => entryCandidates.some((entry) => arg.endsWith(entry)))) return true;
+  const binary = (normalized[0] ?? "").replace(/\.(bat|cmd|exe)$/iu, "");
+  return (
+    binary.endsWith("/openclaw") ||
+    binary === "openclaw" ||
+    (allowGatewayBinary && binary.endsWith("/openclaw-gateway"))
+  );
 }
 
 function findGatewayProcesses(configPath, stateDir) {
@@ -593,9 +610,7 @@ function findGatewayProcesses(configPath, stateDir) {
     } catch {
       continue;
     }
-    const joined = argv.join(" ").toLowerCase();
-    const gatewayIndex = argv.findIndex((arg) => arg === "gateway");
-    if (gatewayIndex === -1 || !joined.includes("openclaw")) continue;
+    if (!isGatewayArgv(argv)) continue;
     const env = readProcessEnv(name);
     if (env) {
       const processConfig = env.OPENCLAW_CONFIG_PATH
@@ -619,8 +634,6 @@ function resolveGatewayPort(config, processes) {
     const envPort = processInfo.env?.OPENCLAW_GATEWAY_PORT;
     if (/^\d+$/u.test(envPort ?? "")) return Number(envPort);
   }
-  const ownPort = process.env.OPENCLAW_GATEWAY_PORT;
-  if (/^\d+$/u.test(ownPort ?? "")) return Number(ownPort);
   const configPort = config.gateway?.port;
   if (Number.isInteger(configPort) && configPort > 0 && configPort <= 65535) return configPort;
   return DEFAULT_GATEWAY_PORT;
@@ -699,6 +712,28 @@ function isLoopbackAddress(address) {
   return address === "::1" || address.startsWith("127.");
 }
 
+function detectContainerEnvironment({
+  env = process.env,
+  fileExists = fs.existsSync,
+  readCgroup = () => fs.readFileSync("/proc/1/cgroup", "utf8"),
+} = {}) {
+  if (env.FLY_MACHINE_ID?.trim() && env.FLY_APP_NAME?.trim()) return true;
+  for (const sentinel of ["/.dockerenv", "/run/.containerenv", "/var/run/.containerenv"]) {
+    try {
+      if (fileExists(sentinel)) return true;
+    } catch {
+      // Try the next local signal.
+    }
+  }
+  try {
+    return /\/docker\/|cri-containerd-[0-9a-f]|containerd\/[0-9a-f]{64}|\/kubepods[/.]|\blxc\b/u.test(
+      readCgroup(),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function checkRuntimeSockets(processDiscovery, expectedPort, reporter) {
   if (!processDiscovery.supported) {
     reporter.unknown(
@@ -707,7 +742,18 @@ function checkRuntimeSockets(processDiscovery, expectedPort, reporter) {
     );
     return;
   }
+  const systemListeners = [
+    ...parseProcListeners("/proc/net/tcp", false),
+    ...parseProcListeners("/proc/net/tcp6", true),
+  ];
   if (processDiscovery.processes.length === 0) {
+    if (systemListeners.some((entry) => entry.port === expectedPort)) {
+      reporter.unknown(
+        "Listening sockets",
+        `TCP port ${expectedPort} is listening, but its owner was not verified as the selected OpenClaw Gateway.`,
+      );
+      return;
+    }
     reporter.info(
       "Listening sockets",
       "OpenClaw Gateway is not running; disk checks still completed.",
@@ -726,10 +772,7 @@ function checkRuntimeSockets(processDiscovery, expectedPort, reporter) {
     }
     for (const inode of inodes) ownedInodes.add(inode);
   }
-  const listeners = [
-    ...parseProcListeners("/proc/net/tcp", false),
-    ...parseProcListeners("/proc/net/tcp6", true),
-  ].filter((entry) => ownedInodes.has(entry.inode));
+  const listeners = systemListeners.filter((entry) => ownedInodes.has(entry.inode));
   if (listeners.length === 0) {
     reporter.unknown(
       "Listening sockets",
@@ -758,9 +801,21 @@ function checkRuntimeSockets(processDiscovery, expectedPort, reporter) {
   }
 }
 
-function configuredBind(config) {
+function configuredBind(config, { containerEnvironment = detectContainerEnvironment() } = {}) {
   const bind = config.gateway?.bind;
-  if (bind === undefined) return { kind: "loopback", detail: "loopback (default)" };
+  const tailscaleMode = config.gateway?.tailscale?.mode ?? config.tailscale?.mode;
+  if (bind === undefined) {
+    if (tailscaleMode && tailscaleMode !== "off") {
+      return {
+        kind: "loopback",
+        detail: `loopback (default for Tailscale ${sanitize(tailscaleMode)})`,
+      };
+    }
+    if (containerEnvironment) {
+      return { kind: "external", detail: "auto -> 0.0.0.0 (container default)" };
+    }
+    return { kind: "loopback", detail: "loopback (default)" };
+  }
   if (typeof bind !== "string") return { kind: "unknown", detail: "gateway.bind is not a string" };
   const normalized = bind.trim().toLowerCase();
   if (["loopback", "127.0.0.1", "localhost", "::1"].includes(normalized)) {
@@ -777,6 +832,9 @@ function configuredBind(config) {
   }
   if (["lan", "0.0.0.0", "::", "tailnet"].includes(normalized)) {
     return { kind: "external", detail: normalized };
+  }
+  if (normalized === "auto" && containerEnvironment) {
+    return { kind: "external", detail: "auto -> 0.0.0.0 (container)" };
   }
   if (normalized === "auto") return { kind: "unknown", detail: "auto (runtime-dependent)" };
   return { kind: "unknown", detail: sanitize(normalized) };
@@ -797,67 +855,142 @@ function checkBind(config, reporter) {
   return bind;
 }
 
-function resolveSecretReference(value, config, environment, stateDir) {
+function parseSecretReference(value) {
   if (typeof value === "string") {
-    const interpolation = value.match(/^\$\{([A-Z_][A-Z0-9_]*)\}$/u);
-    if (interpolation) {
-      const resolved =
-        environment[interpolation[1]] ??
-        readDotEnvSecret(path.join(stateDir, ".env"), interpolation[1]);
-      return resolved === undefined
-        ? { status: "unknown", source: "environment interpolation" }
-        : { status: "value", value: resolved, source: "environment interpolation" };
-    }
-    return { status: "value", value, source: "config" };
+    const trimmed = value.trim();
+    const envMarker =
+      trimmed.match(/^\$\{([A-Z][A-Z0-9_]{0,127})\}$/u) ??
+      trimmed.match(/^\$([A-Z][A-Z0-9_]{0,127})$/u) ??
+      trimmed.match(/^(?:secretref-env:|__env__:)([A-Z][A-Z0-9_]{0,127})$/u);
+    return envMarker ? { source: "env", provider: "default", id: envMarker[1] } : null;
   }
-  if (!isObject(value)) return { status: "absent", source: "config" };
-  if (value.source === "env" && typeof value.id === "string") {
-    const resolved =
-      environment[value.id] ?? readDotEnvSecret(path.join(stateDir, ".env"), value.id);
-    return resolved === undefined
-      ? { status: "unknown", source: "environment SecretRef" }
-      : { status: "value", value: resolved, source: "environment SecretRef" };
+  if (!isObject(value)) return null;
+  if (
+    typeof value.source === "string" &&
+    value.source.trim().length > 0 &&
+    typeof value.id === "string" &&
+    value.id.trim().length > 0
+  ) {
+    return {
+      source: value.source,
+      provider:
+        typeof value.provider === "string" && value.provider.trim()
+          ? value.provider.trim()
+          : "default",
+      id: value.id.trim(),
+    };
   }
-  if (value.source === "file") {
-    const provider =
-      typeof value.provider === "string" ? config.secrets?.providers?.[value.provider] : undefined;
-    const providerPath = expandLocalPath(provider?.path, os.homedir());
-    if (!providerPath) return { status: "unknown", source: "file SecretRef" };
-    try {
-      const raw = readLimited(providerPath, 1024 * 1024);
-      let parsed;
-      try {
-        parsed = parseJson5(raw);
-      } catch {
-        parsed = null;
-      }
-      if (
-        isObject(parsed) &&
-        typeof value.id === "string" &&
-        typeof parsed[value.id] === "string"
-      ) {
-        return {
-          status: "value",
-          value: parsed[value.id],
-          source: "file SecretRef",
-          filePath: providerPath,
-        };
-      }
-      return { status: "unknown", source: "file SecretRef", filePath: providerPath };
-    } catch {
-      return { status: "unknown", source: "file SecretRef", filePath: providerPath };
-    }
-  }
-  return { status: "unknown", source: `${sanitize(value.source ?? "unknown")} SecretRef` };
+  return null;
 }
 
-function runtimeEnvironment(processes) {
-  const environment = Object.assign(Object.create(null), process.env);
+function gatewayEnvironment(processes) {
+  const environment = Object.create(null);
+  const conflicts = new Set();
   for (const processInfo of processes) {
     if (!processInfo.env) continue;
-    for (const [key, value] of Object.entries(processInfo.env)) environment[key] = value;
+    for (const [key, value] of Object.entries(processInfo.env)) {
+      if (conflicts.has(key)) continue;
+      if (Object.hasOwn(environment, key) && environment[key] !== value) {
+        delete environment[key];
+        conflicts.add(key);
+      } else {
+        environment[key] = value;
+      }
+    }
   }
   return environment;
+}
+
+function nonEmptyEnvironmentValue(value, source) {
+  return typeof value === "string" && value.trim().length > 0
+    ? { status: "value", value, source }
+    : null;
+}
+
+function resolveKnownEnvironment(refId, envKey, environment, stateDir, allowStateEnv) {
+  const envFile = path.join(stateDir, ".env");
+  const candidates = [];
+  if (refId) {
+    candidates.push(
+      nonEmptyEnvironmentValue(environment[refId], "Gateway process environment ref"),
+    );
+    if (allowStateEnv) {
+      candidates.push(nonEmptyEnvironmentValue(readDotEnvSecret(envFile, refId), "state .env ref"));
+    }
+  }
+  candidates.push(
+    nonEmptyEnvironmentValue(environment[envKey], "Gateway process environment bootstrap"),
+  );
+  if (allowStateEnv) {
+    candidates.push(
+      nonEmptyEnvironmentValue(readDotEnvSecret(envFile, envKey), "state .env bootstrap"),
+    );
+  }
+  return candidates.find(Boolean) ?? null;
+}
+
+function resolveSecretReference(ref, config, environment, stateDir, envKey, allowStateEnv) {
+  if (ref.source === "env") {
+    return (
+      resolveKnownEnvironment(ref.id, envKey, environment, stateDir, allowStateEnv) ?? {
+        status: "unknown",
+        source: "environment SecretRef",
+      }
+    );
+  }
+  if (ref.source === "file") {
+    const provider = config.secrets?.providers?.[ref.provider];
+    const providerPath = expandLocalPath(provider?.path, os.homedir());
+    if (providerPath) {
+      try {
+        const parsed = parseJson5(readLimited(providerPath, 1024 * 1024));
+        if (isObject(parsed) && typeof parsed[ref.id] === "string") {
+          return {
+            status: "value",
+            value: parsed[ref.id],
+            source: "file SecretRef",
+            filePath: providerPath,
+          };
+        }
+      } catch {
+        // Bootstrap environment fallback remains available below.
+      }
+    }
+    return (
+      resolveKnownEnvironment(null, envKey, environment, stateDir, allowStateEnv) ?? {
+        status: "unknown",
+        source: "file SecretRef",
+        ...(providerPath ? { filePath: providerPath } : {}),
+      }
+    );
+  }
+  return (
+    resolveKnownEnvironment(null, envKey, environment, stateDir, allowStateEnv) ?? {
+      status: "unknown",
+      source: `${sanitize(ref.source)} SecretRef`,
+    }
+  );
+}
+
+function resolveGatewayCredential(configValue, config, processes, stateDir, envKey) {
+  const environment = gatewayEnvironment(processes);
+  const allowStateEnv = processes.length === 0;
+  const ref = parseSecretReference(configValue);
+  if (ref) {
+    return resolveSecretReference(ref, config, environment, stateDir, envKey, allowStateEnv);
+  }
+  if (typeof configValue === "string" && configValue.trim().length > 0) {
+    return { status: "value", value: configValue, source: "config" };
+  }
+  if (configValue !== undefined && configValue !== null && typeof configValue !== "string") {
+    return { status: "unknown", source: "unrecognized config credential" };
+  }
+  return (
+    resolveKnownEnvironment(null, envKey, environment, stateDir, allowStateEnv) ?? {
+      status: "absent",
+      source: "known sources",
+    }
+  );
 }
 
 function checkOneSecret({
@@ -870,29 +1003,26 @@ function checkOneSecret({
   processes,
   stateDir,
   reporter,
+  resolved,
 }) {
-  const environment = runtimeEnvironment(processes);
-  const runtimeValue = environment[envKey] ?? readDotEnvSecret(path.join(stateDir, ".env"), envKey);
-  const resolved =
-    runtimeValue !== undefined
-      ? { status: "value", value: runtimeValue, source: "runtime environment" }
-      : resolveSecretReference(configValue, config, environment, stateDir);
-  if (resolved.filePath)
-    checkFilePermission(resolved.filePath, reporter, "SecretRef file permissions");
-  if (resolved.status === "unknown") {
+  const credential =
+    resolved ?? resolveGatewayCredential(configValue, config, processes, stateDir, envKey);
+  if (credential.filePath)
+    checkFilePermission(credential.filePath, reporter, "SecretRef file permissions");
+  if (credential.status === "unknown") {
     reporter.unknown(
       label,
-      `${mode} auth is configured via ${resolved.source}, but its value could not be resolved safely.`,
+      `${mode} auth is configured via ${credential.source}, but its value could not be resolved safely.`,
     );
     return false;
   }
-  if (resolved.status !== "value") {
+  if (credential.status !== "value") {
     reporter.fail(label, `${mode} auth is selected, but no credential is configured.`);
     return false;
   }
-  const value = resolved.value.trim();
+  const value = credential.value.trim();
   if (value.length === 0) {
-    reporter.fail(label, `${mode} credential is empty (${resolved.source}).`);
+    reporter.fail(label, `${mode} credential is empty (${credential.source}).`);
     return false;
   }
   if (weakValues.has(value)) {
@@ -905,13 +1035,13 @@ function checkOneSecret({
   if (mode === "token" && value.length < 24) {
     reporter.warn(
       label,
-      `present via ${resolved.source}, length ${value.length}; shorter than 24 characters.`,
+      `present via ${credential.source}, length ${value.length}; shorter than 24 characters.`,
     );
     return true;
   }
   reporter.pass(
     label,
-    `present via ${resolved.source}, length ${value.length}; value was not printed.`,
+    `present via ${credential.source}, length ${value.length}; value was not printed.`,
   );
   return true;
 }
@@ -919,12 +1049,26 @@ function checkOneSecret({
 function checkAuth(config, processes, stateDir, bind, reporter) {
   const auth = isObject(config.gateway?.auth) ? config.gateway.auth : Object.create(null);
   let mode = typeof auth.mode === "string" ? auth.mode : undefined;
+  let tokenCredential;
+  let passwordCredential;
   if (!mode) {
-    const environment = runtimeEnvironment(processes);
-    const hasToken = auth.token !== undefined || environment.OPENCLAW_GATEWAY_TOKEN !== undefined;
-    const hasPassword =
-      auth.password !== undefined || environment.OPENCLAW_GATEWAY_PASSWORD !== undefined;
-    mode = hasToken ? "token" : hasPassword ? "password" : "none";
+    tokenCredential = resolveGatewayCredential(
+      auth.token,
+      config,
+      processes,
+      stateDir,
+      "OPENCLAW_GATEWAY_TOKEN",
+    );
+    passwordCredential = resolveGatewayCredential(
+      auth.password,
+      config,
+      processes,
+      stateDir,
+      "OPENCLAW_GATEWAY_PASSWORD",
+    );
+    const passwordAvailable =
+      passwordCredential.status === "value" && passwordCredential.value.trim().length > 0;
+    mode = passwordAvailable ? "password" : "token";
   }
   if (mode === "token") {
     checkOneSecret({
@@ -937,6 +1081,7 @@ function checkAuth(config, processes, stateDir, bind, reporter) {
       processes,
       stateDir,
       reporter,
+      resolved: tokenCredential,
     });
   } else if (mode === "password") {
     checkOneSecret({
@@ -949,19 +1094,46 @@ function checkAuth(config, processes, stateDir, bind, reporter) {
       processes,
       stateDir,
       reporter,
+      resolved: passwordCredential,
     });
   } else if (mode === "trusted-proxy") {
-    const proxies = config.gateway?.trustedProxies;
-    if (!Array.isArray(proxies) || proxies.length === 0) {
+    const userHeader = auth.trustedProxy?.userHeader;
+    if (typeof userHeader !== "string" || userHeader.trim().length === 0) {
       reporter.fail(
         "Gateway authentication",
-        "trusted-proxy mode has no gateway.trustedProxies entries.",
+        "trusted-proxy mode has no non-empty gateway.auth.trustedProxy.userHeader.",
       );
     } else {
-      reporter.warn(
-        "Gateway authentication",
-        "trusted-proxy mode delegates the authentication boundary; review the proxy allowlist.",
+      const sharedToken = resolveGatewayCredential(
+        auth.token,
+        config,
+        processes,
+        stateDir,
+        "OPENCLAW_GATEWAY_TOKEN",
       );
+      const tokenInputConfigured =
+        typeof auth.token === "string"
+          ? auth.token.trim().length > 0
+          : auth.token !== undefined && auth.token !== null;
+      if (sharedToken.status === "value" && sharedToken.value.trim().length > 0) {
+        reporter.fail(
+          "Gateway authentication",
+          "trusted-proxy mode also has a shared token configured; remove the conflicting token.",
+        );
+      } else if (
+        (tokenInputConfigured && sharedToken.status === "unknown") ||
+        processes.some((processInfo) => processInfo.env === null)
+      ) {
+        reporter.unknown(
+          "Gateway authentication",
+          "trusted-proxy userHeader is present, but a conflicting runtime token could not be ruled out.",
+        );
+      } else {
+        reporter.pass(
+          "Gateway authentication",
+          "trusted-proxy mode has a non-empty userHeader; authentication is delegated to the proxy.",
+        );
+      }
     }
   } else {
     reporter.fail(
@@ -1008,10 +1180,10 @@ function findPackageRoot(explicitRoot, home) {
   } else {
     for (const directory of String(process.env.PATH ?? "").split(path.delimiter)) {
       if (!directory) continue;
-      for (const executable of process.platform === "win32"
+      for (const binaryName of process.platform === "win32"
         ? ["openclaw.cmd", "openclaw.exe"]
         : ["openclaw"]) {
-        const binPath = path.join(directory, executable);
+        const binPath = path.join(directory, binaryName);
         try {
           const resolved = fs.realpathSync(binPath);
           candidates.push(path.dirname(resolved));
@@ -1182,7 +1354,7 @@ function parseManifest(filePath) {
   }
 }
 
-function pluginRoots(packageInfo, stateDir, config, home) {
+function pluginRoots(packageInfo, stateDir, configPath, config, home) {
   const roots = [];
   const add = (root, bundled, origin, depth) => {
     if (root && fs.existsSync(root)) roots.push({ root, bundled, origin, depth });
@@ -1190,10 +1362,14 @@ function pluginRoots(packageInfo, stateDir, config, home) {
   if (packageInfo) {
     add(path.join(packageInfo.root, "extensions"), true, "bundled", 3);
     add(path.join(packageInfo.root, "dist", "extensions"), true, "bundled", 3);
+    add(path.join(packageInfo.root, "dist-runtime", "extensions"), true, "bundled", 3);
   }
+  const configDir = path.dirname(configPath);
   add(path.join(stateDir, "extensions"), false, "managed/local", 5);
   add(path.join(stateDir, "plugins"), false, "managed/local", 5);
   add(path.join(stateDir, "npm", "projects"), false, "managed npm", 8);
+  add(path.join(configDir, "extensions"), false, "config-dir managed/local", 5);
+  add(path.join(configDir, "npm", "projects"), false, "config-dir managed npm", 8);
   const loadPaths = config.plugins?.load?.paths;
   if (Array.isArray(loadPaths)) {
     for (const entry of loadPaths) add(expandLocalPath(entry, home), false, "configured path", 4);
@@ -1201,9 +1377,9 @@ function pluginRoots(packageInfo, stateDir, config, home) {
   return roots;
 }
 
-function collectPlugins(packageInfo, stateDir, config, home, reporter) {
+function collectPlugins(packageInfo, stateDir, configPath, config, home, reporter) {
   const records = new Map();
-  for (const rootInfo of pluginRoots(packageInfo, stateDir, config, home)) {
+  for (const rootInfo of pluginRoots(packageInfo, stateDir, configPath, config, home)) {
     for (const manifestPath of walkForNamedFile(
       rootInfo.root,
       "openclaw.plugin.json",
@@ -1401,7 +1577,7 @@ function main() {
   checkAuth(config, processDiscovery.processes, paths.stateDir, bind, reporter);
   checkControlUi(config, reporter);
   const gatewayPort = resolveGatewayPort(config, processDiscovery.processes);
-  reporter.info("Gateway port", `${gatewayPort} (config/env/process precedence applied).`);
+  reporter.info("Gateway port", `${gatewayPort} (config/Gateway-process precedence applied).`);
   checkRuntimeSockets(processDiscovery, gatewayPort, reporter);
 
   const packageInfo = findPackageRoot(options.packageRoot, paths.home);
@@ -1412,7 +1588,14 @@ function main() {
     checkFilePermission(filePath, reporter);
   }
 
-  const plugins = collectPlugins(packageInfo, paths.stateDir, config, paths.home, reporter);
+  const plugins = collectPlugins(
+    packageInfo,
+    paths.stateDir,
+    paths.configPath,
+    config,
+    paths.home,
+    reporter,
+  );
   collectSkills(packageInfo, paths.stateDir, config, paths.home, plugins, reporter);
 
   console.log("");
@@ -1425,4 +1608,15 @@ function main() {
   return 1;
 }
 
-process.exitCode = main();
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+  }
+}
+
+if (isDirectRun()) process.exitCode = main();
+
+export { configuredBind, detectContainerEnvironment, isGatewayArgv, resolveGatewayCredential };

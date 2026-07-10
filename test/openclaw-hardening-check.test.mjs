@@ -5,11 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  configuredBind,
+  detectContainerEnvironment,
+  isGatewayArgv,
+  resolveGatewayCredential,
+} from "../openclaw-hardening-check.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "openclaw-hardening-check.mjs");
+const TEST_PORT = 40000 + (process.pid % 20000);
 
-function fixture(version = "2026.6.10") {
+function fixture(version = "2026.6.10", { configOutsideState = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-hardening-check-"));
   const home = path.join(directory, "home");
   const stateDir = path.join(home, ".openclaw");
@@ -26,7 +33,9 @@ function fixture(version = "2026.6.10") {
     home,
     stateDir,
     packageRoot,
-    configPath: path.join(stateDir, "openclaw.json"),
+    configPath: configOutsideState
+      ? path.join(directory, "config", "openclaw.json")
+      : path.join(stateDir, "openclaw.json"),
   };
 }
 
@@ -51,6 +60,7 @@ function run(f, extraArgs = [], env = {}) {
 }
 
 function writeConfig(f, value) {
+  fs.mkdirSync(path.dirname(f.configPath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(f.configPath, typeof value === "string" ? value : `${JSON.stringify(value)}\n`, {
     mode: 0o600,
   });
@@ -74,7 +84,7 @@ test("a safe JSON5 config and the Cain pin pass", () => {
       gateway: {
         mode: 'local',
         bind: 'loopback',
-        port: 18789,
+        port: ${TEST_PORT},
         auth: { mode: 'token', token: '0123456789abcdef0123456789abcdef', },
       },
     }`,
@@ -90,6 +100,7 @@ test("versions before 2026.1.29 are reported as affected", () => {
   writeConfig(f, {
     gateway: {
       bind: "loopback",
+      port: TEST_PORT,
       auth: { mode: "token", token: "0123456789abcdef0123456789abcdef" },
     },
   });
@@ -104,6 +115,7 @@ test("secret values never appear in output", () => {
   writeConfig(f, {
     gateway: {
       bind: "lan",
+      port: TEST_PORT,
       auth: { mode: "token", token: secret },
     },
   });
@@ -119,6 +131,7 @@ test("published placeholder tokens are rejected without being echoed", () => {
   writeConfig(f, {
     gateway: {
       bind: "loopback",
+      port: TEST_PORT,
       auth: { mode: "token", token: placeholder },
     },
   });
@@ -133,6 +146,7 @@ test("moving install targets are flagged", () => {
   writeConfig(f, {
     gateway: {
       bind: "loopback",
+      port: TEST_PORT,
       auth: { mode: "token", token: "0123456789abcdef0123456789abcdef" },
     },
   });
@@ -141,12 +155,219 @@ test("moving install targets are flagged", () => {
   assert.match(result.stdout, /install target latest is moving/u);
 });
 
-test("the script contains no network API calls", () => {
+test("plain config token wins over the auditor environment", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token", token: "weak12" },
+    },
+  });
+  const result = run(f, ["--install-spec", "2026.6.10"], {
+    OPENCLAW_GATEWAY_TOKEN: "A".repeat(48),
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stdout, /Gateway authentication: present via config, length 6/u);
+  assert.doesNotMatch(result.stdout, /Gateway authentication:.*length 48/u);
+});
+
+test("plain config token also wins over the matched Gateway process environment", () => {
+  const resolved = resolveGatewayCredential(
+    "weak12",
+    { gateway: { auth: { mode: "token", token: "weak12" } } },
+    [{ env: { OPENCLAW_GATEWAY_TOKEN: "A".repeat(48) } }],
+    os.tmpdir(),
+    "OPENCLAW_GATEWAY_TOKEN",
+  );
+  assert.equal(resolved.status, "value");
+  assert.equal(resolved.source, "config");
+  assert.equal(resolved.value.length, 6);
+});
+
+test("all supported string env refs fail closed when unresolved", () => {
+  const markers = [
+    "$MY_LONG_GATEWAY_TOKEN_ID_123456",
+    "secretref-env:MY_LONG_GATEWAY_TOKEN_ID_123456",
+    "__env__:MY_LONG_GATEWAY_TOKEN_ID_123456",
+  ];
+  for (const marker of markers) {
+    const f = fixture();
+    writeConfig(f, {
+      gateway: {
+        bind: "loopback",
+        port: TEST_PORT,
+        auth: { mode: "token", token: marker },
+      },
+    });
+    const result = run(f, ["--install-spec", "2026.6.10"], {
+      MY_LONG_GATEWAY_TOKEN_ID_123456: "B".repeat(48),
+      OPENCLAW_GATEWAY_TOKEN: "C".repeat(48),
+    });
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stdout, /\[CANNOT CHECK\] Gateway authentication/u);
+    assert.doesNotMatch(result.stdout, /\[PASS\] Gateway authentication/u);
+  }
+});
+
+test("an env ref can use the Gateway bootstrap token from state .env", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token", token: "$MISSING_DEDICATED_REF" },
+    },
+  });
+  fs.writeFileSync(path.join(f.stateDir, ".env"), `OPENCLAW_GATEWAY_TOKEN=${"D".repeat(32)}\n`, {
+    mode: 0o600,
+  });
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 0, result.stdout);
+  assert.match(result.stdout, /present via state \.env bootstrap, length 32/u);
+});
+
+test("an env ref can use the matched Gateway process bootstrap token", () => {
+  const resolved = resolveGatewayCredential(
+    "$MISSING_DEDICATED_REF",
+    { gateway: { auth: { mode: "token" } } },
+    [{ env: { OPENCLAW_GATEWAY_TOKEN: "E".repeat(32) } }],
+    os.tmpdir(),
+    "OPENCLAW_GATEWAY_TOKEN",
+  );
+  assert.equal(resolved.status, "value");
+  assert.equal(resolved.source, "Gateway process environment bootstrap");
+  assert.equal(resolved.value.length, 32);
+});
+
+test("trusted-proxy auth is gated by its userHeader", () => {
+  const valid = fixture();
+  writeConfig(valid, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "trusted-proxy", trustedProxy: { userHeader: "x-auth-user" } },
+    },
+  });
+  const validResult = run(valid, ["--install-spec", "2026.6.10"]);
+  assert.equal(validResult.status, 0, validResult.stdout);
+  assert.match(validResult.stdout, /trusted-proxy mode has a non-empty userHeader/u);
+
+  const invalid = fixture();
+  writeConfig(invalid, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "trusted-proxy", trustedProxy: { userHeader: " " } },
+    },
+  });
+  const invalidResult = run(invalid, ["--install-spec", "2026.6.10"]);
+  assert.equal(invalidResult.status, 1);
+  assert.match(invalidResult.stdout, /no non-empty gateway\.auth\.trustedProxy\.userHeader/u);
+});
+
+test("an unset bind defaults to external auto mode in a container", () => {
+  assert.deepEqual(configuredBind({ gateway: {} }, { containerEnvironment: true }), {
+    kind: "external",
+    detail: "auto -> 0.0.0.0 (container default)",
+  });
+  assert.equal(
+    configuredBind({ gateway: {}, tailscale: { mode: "serve" } }, { containerEnvironment: true })
+      .kind,
+    "loopback",
+  );
+  assert.equal(
+    detectContainerEnvironment({
+      env: {},
+      fileExists: (candidate) => candidate === "/.dockerenv",
+      readCgroup: () => "0::/",
+    }),
+    true,
+  );
+});
+
+test("Gateway argv detection accepts entry files and the dedicated binary", () => {
+  assert.equal(isGatewayArgv(["node", "/srv/dist/index.js", "gateway", "--port", "18789"]), true);
+  assert.equal(isGatewayArgv(["/usr/local/bin/openclaw-gateway", "gateway"]), true);
+  assert.equal(isGatewayArgv(["node", "/srv/worker.js", "gateway"]), false);
+});
+
+test("plugin inventory includes dist-runtime and config-directory roots", () => {
+  const f = fixture("2026.6.10", { configOutsideState: true });
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token", token: "0123456789abcdef0123456789abcdef" },
+    },
+  });
+  const bundled = path.join(f.packageRoot, "dist-runtime", "extensions", "stock-only");
+  const managed = path.join(path.dirname(f.configPath), "extensions", "review-me");
+  fs.mkdirSync(bundled, { recursive: true });
+  fs.mkdirSync(managed, { recursive: true });
+  fs.writeFileSync(
+    path.join(bundled, "openclaw.plugin.json"),
+    JSON.stringify({ id: "stock-only" }),
+  );
+  fs.writeFileSync(path.join(managed, "openclaw.plugin.json"), JSON.stringify({ id: "review-me" }));
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stdout, /Bundled plugins: 1: stock-only/u);
+  assert.match(result.stdout, /Third-party plugins: 1: review-me/u);
+});
+
+test("canary secrets never appear through config, env-file, ref, or password branches", () => {
+  const cases = [
+    {
+      name: "config token",
+      auth: (secret) => ({ mode: "token", token: secret }),
+    },
+    {
+      name: "environment token",
+      auth: () => ({ mode: "token" }),
+      envLine: (secret) => `OPENCLAW_GATEWAY_TOKEN=${secret}\n`,
+    },
+    {
+      name: "environment ref",
+      auth: () => ({ mode: "token", token: "$CANARY_GATEWAY_REF" }),
+      envLine: (secret) => `CANARY_GATEWAY_REF=${secret}\n`,
+    },
+    {
+      name: "config password",
+      auth: (secret) => ({ mode: "password", password: secret }),
+    },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    const f = fixture();
+    const secret = `CANARY_${index}_${"Z".repeat(32)}`;
+    writeConfig(f, {
+      gateway: { bind: "loopback", port: TEST_PORT, auth: entry.auth(secret) },
+    });
+    if (entry.envLine) {
+      fs.writeFileSync(path.join(f.stateDir, ".env"), entry.envLine(secret), { mode: 0o600 });
+    }
+    const result = run(f, ["--install-spec", "2026.6.10"]);
+    assert.equal(result.status, 0, `${entry.name}\n${result.stdout}`);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(secret, "u"));
+    assert.match(result.stdout, new RegExp(`length ${secret.length}`, "u"));
+  }
+});
+
+test("the script contains no network or process-launch API calls", () => {
   const source = fs.readFileSync(script, "utf8");
-  assert.doesNotMatch(source, /fetch|http|https\.request|net\.connect/iu);
+  assert.doesNotMatch(source, /fetch|http|https\.request|net\.connect|child_process|exec|spawn/iu);
   assert.doesNotMatch(source, /node:(?:http|https|net|tls|dns|dgram)/u);
 });
 
 test("the script is syntactically valid", () => {
   execFileSync(process.execPath, ["--check", script], { stdio: "pipe" });
+});
+
+test("invalid command-line options are explained and exit 2", () => {
+  const result = spawnSync(process.execPath, [script, "--bogus"], {
+    encoding: "utf8",
+    env: { HOME: os.tmpdir(), PATH: "" },
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Unknown option: --bogus/u);
 });
