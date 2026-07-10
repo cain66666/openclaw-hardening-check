@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -227,6 +227,63 @@ test("an env ref can use the Gateway bootstrap token from state .env", () => {
   assert.match(result.stdout, /present via state \.env bootstrap, length 32/u);
 });
 
+test("a stopped Gateway can use its systemd environment file token", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token" },
+    },
+  });
+  fs.writeFileSync(
+    path.join(f.stateDir, "gateway.systemd.env"),
+    `OPENCLAW_GATEWAY_TOKEN=${"S".repeat(32)}\n`,
+    { mode: 0o600 },
+  );
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 0, result.stdout);
+  assert.match(result.stdout, /present via gateway\.systemd\.env bootstrap, length 32/u);
+});
+
+test("a plain config token wins over gateway.systemd.env", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token", token: "weak12" },
+    },
+  });
+  fs.writeFileSync(
+    path.join(f.stateDir, "gateway.systemd.env"),
+    `OPENCLAW_GATEWAY_TOKEN=${"S".repeat(48)}\n`,
+    { mode: 0o600 },
+  );
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stdout, /Gateway authentication: present via config, length 6/u);
+  assert.doesNotMatch(result.stdout, /Gateway authentication:.*length 48/u);
+});
+
+test("a stopped Gateway without a disk token is reported as unverified", () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token" },
+    },
+  });
+  const result = run(f, ["--install-spec", "2026.6.10"]);
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(
+    result.stdout,
+    /\[CANNOT CHECK\] Gateway authentication: token auth is selected, but no token was found in config, state \.env, or gateway\.systemd\.env/u,
+  );
+  assert.doesNotMatch(result.stdout, /no credential is configured/u);
+});
+
 test("an env ref can use the matched Gateway process bootstrap token", () => {
   const resolved = resolveGatewayCredential(
     "$MISSING_DEDICATED_REF",
@@ -238,6 +295,44 @@ test("an env ref can use the matched Gateway process bootstrap token", () => {
   assert.equal(resolved.status, "value");
   assert.equal(resolved.source, "Gateway process environment bootstrap");
   assert.equal(resolved.value.length, 32);
+});
+
+test("a running Gateway with no token still reports a failure", async () => {
+  const f = fixture();
+  writeConfig(f, {
+    gateway: {
+      bind: "loopback",
+      port: TEST_PORT,
+      auth: { mode: "token" },
+    },
+  });
+  const entryFile = path.join(f.directory, "dist", "index.js");
+  fs.mkdirSync(path.dirname(entryFile), { recursive: true });
+  fs.writeFileSync(entryFile, "setInterval(() => {}, 1000);\n", { mode: 0o600 });
+  const gateway = spawn(process.execPath, [entryFile, "gateway", "--port", String(TEST_PORT)], {
+    env: {
+      HOME: f.home,
+      OPENCLAW_CONFIG_PATH: f.configPath,
+      OPENCLAW_STATE_DIR: f.stateDir,
+      PATH: "",
+    },
+    stdio: "ignore",
+  });
+  await new Promise((resolve, reject) => {
+    gateway.once("spawn", resolve);
+    gateway.once("error", reject);
+  });
+  try {
+    const result = run(f, ["--install-spec", "2026.6.10"]);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(
+      result.stdout,
+      /\[FAIL\] Gateway authentication: token auth is selected, but no token was found in config or the Gateway process environment/u,
+    );
+  } finally {
+    gateway.kill();
+    await new Promise((resolve) => gateway.once("close", resolve));
+  }
 });
 
 test("trusted-proxy auth is gated by its userHeader", () => {
@@ -333,6 +428,12 @@ test("canary secrets never appear through config, env-file, ref, or password bra
       envLine: (secret) => `CANARY_GATEWAY_REF=${secret}\n`,
     },
     {
+      name: "systemd environment token",
+      auth: () => ({ mode: "token" }),
+      envFile: "gateway.systemd.env",
+      envLine: (secret) => `OPENCLAW_GATEWAY_TOKEN=${secret}\n`,
+    },
+    {
       name: "config password",
       auth: (secret) => ({ mode: "password", password: secret }),
     },
@@ -344,7 +445,9 @@ test("canary secrets never appear through config, env-file, ref, or password bra
       gateway: { bind: "loopback", port: TEST_PORT, auth: entry.auth(secret) },
     });
     if (entry.envLine) {
-      fs.writeFileSync(path.join(f.stateDir, ".env"), entry.envLine(secret), { mode: 0o600 });
+      fs.writeFileSync(path.join(f.stateDir, entry.envFile ?? ".env"), entry.envLine(secret), {
+        mode: 0o600,
+      });
     }
     const result = run(f, ["--install-spec", "2026.6.10"]);
     assert.equal(result.status, 0, `${entry.name}\n${result.stdout}`);

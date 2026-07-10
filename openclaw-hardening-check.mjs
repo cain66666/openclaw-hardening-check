@@ -10,6 +10,7 @@ const DEFAULT_GATEWAY_PORT = 18789;
 const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 const MAX_INCLUDE_DEPTH = 10;
 const MAX_INVENTORY_ITEMS = 1000;
+const SYSTEMD_GATEWAY_ENV_FILENAME = "gateway.systemd.env";
 const KNOWN_WEAK_TOKENS = new Set(["change-me-to-a-long-random-token", "change-me-now"]);
 const KNOWN_WEAK_PASSWORDS = new Set(["change-me-to-a-strong-password"]);
 
@@ -909,13 +910,20 @@ function nonEmptyEnvironmentValue(value, source) {
 
 function resolveKnownEnvironment(refId, envKey, environment, stateDir, allowStateEnv) {
   const envFile = path.join(stateDir, ".env");
+  const systemdEnvFile = path.join(stateDir, SYSTEMD_GATEWAY_ENV_FILENAME);
   const candidates = [];
   if (refId) {
     candidates.push(
       nonEmptyEnvironmentValue(environment[refId], "Gateway process environment ref"),
     );
     if (allowStateEnv) {
-      candidates.push(nonEmptyEnvironmentValue(readDotEnvSecret(envFile, refId), "state .env ref"));
+      candidates.push(
+        nonEmptyEnvironmentValue(
+          readDotEnvSecret(systemdEnvFile, refId),
+          "gateway.systemd.env ref",
+        ),
+        nonEmptyEnvironmentValue(readDotEnvSecret(envFile, refId), "state .env ref"),
+      );
     }
   }
   candidates.push(
@@ -923,6 +931,10 @@ function resolveKnownEnvironment(refId, envKey, environment, stateDir, allowStat
   );
   if (allowStateEnv) {
     candidates.push(
+      nonEmptyEnvironmentValue(
+        readDotEnvSecret(systemdEnvFile, envKey),
+        "gateway.systemd.env bootstrap",
+      ),
       nonEmptyEnvironmentValue(readDotEnvSecret(envFile, envKey), "state .env bootstrap"),
     );
   }
@@ -1017,7 +1029,17 @@ function checkOneSecret({
     return false;
   }
   if (credential.status !== "value") {
-    reporter.fail(label, `${mode} auth is selected, but no credential is configured.`);
+    if (processes.length === 0) {
+      reporter.unknown(
+        label,
+        `${mode} auth is selected, but no ${mode} was found in config, state .env, or gateway.systemd.env; if it is supplied via another service environment or the Gateway process environment, start the Gateway and re-run.`,
+      );
+    } else {
+      reporter.fail(
+        label,
+        `${mode} auth is selected, but no ${mode} was found in config or the Gateway process environment.`,
+      );
+    }
     return false;
   }
   const value = credential.value.trim();
@@ -1515,8 +1537,10 @@ function collectSkills(packageInfo, stateDir, config, home, plugins, reporter) {
 
 function collectSecretFiles(configPath, loadedFiles, stateDir) {
   const files = new Set([configPath, ...loadedFiles]);
-  const dotEnv = path.join(stateDir, ".env");
-  if (fs.existsSync(dotEnv)) files.add(dotEnv);
+  for (const envFile of [".env", SYSTEMD_GATEWAY_ENV_FILENAME]) {
+    const filePath = path.join(stateDir, envFile);
+    if (fs.existsSync(filePath)) files.add(filePath);
+  }
   for (const filePath of walkForNamedFile(
     path.join(stateDir, "agents"),
     "auth-profiles.json",
